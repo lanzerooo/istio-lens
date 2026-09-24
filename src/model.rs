@@ -12,13 +12,13 @@ use std::collections::BTreeMap;
     namespaced
 )]
 pub struct GatewaySpec {
-    pub selector: BTreeMap<String, String>,
-    pub servers: Vec<Server>,
+    pub selector: Option<BTreeMap<String, String>>,
+    pub servers: Option<Vec<Server>>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Server {
-    pub port: Port,
+    pub port: Option<Port>,
     pub hosts: Vec<String>,
 }
 
@@ -100,7 +100,21 @@ pub struct Subset {
     pub labels: Option<BTreeMap<String, String>>,
 }
 
-/// Унифицированный идентификатор ресурса в кластере
+/// Поддержка ServiceEntry для учета внешних сервисов Mesh
+#[derive(CustomResource, Serialize, Deserialize, Default, Clone, Debug, PartialEq, JsonSchema)]
+#[kube(
+    group = "networking.istio.io",
+    version = "v1beta1",
+    kind = "ServiceEntry",
+    plural = "serviceentries",
+    namespaced
+)]
+pub struct ServiceEntrySpec {
+    pub hosts: Vec<String>,
+    pub location: Option<String>,
+    pub resolution: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ResourceKey {
     pub namespace: String,
@@ -113,10 +127,5 @@ impl ResourceKey {
             namespace: namespace.into(),
             name: name.into(),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn to_fqdn(&self) -> String {
-        format!("{}.{}.svc.cluster.local", self.name, self.namespace)
     }
 }

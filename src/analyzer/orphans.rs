@@ -16,7 +16,7 @@ pub fn detect_orphans(snapshot: &ClusterSnapshot) -> Vec<AuditIssue> {
         }
     }
 
-    // 1. Поиск неиспользуемых Gateway (на которые не ссылается ни один VS)
+    // 1. Поиск Gateway без VirtualService
     for gw in &snapshot.gateways {
         let name = gw.name_any();
         let ns = gw.namespace().unwrap_or_default();
@@ -29,12 +29,12 @@ pub fn detect_orphans(snapshot: &ClusterSnapshot) -> Vec<AuditIssue> {
                 resource: name,
                 namespace: ns,
                 severity: IssueSeverity::Warning,
-                description: "Шлюз не используется: ни один VirtualService не привязан к нему".into(),
+                description: "Неиспользуемый шлюз: ни один VirtualService не привязан к нему".into(),
             });
         }
     }
 
-    // 2. VirtualService указывает на несуществующий K8s Service
+    // 2. Валидация маршрутов VS: существование сервиса + Ready Endpoints
     for vs in &snapshot.virtual_services {
         let vs_ns = vs.namespace().unwrap_or_else(|| "default".into());
         if let Some(http_routes) = &vs.spec.http {
@@ -42,17 +42,54 @@ pub fn detect_orphans(snapshot: &ClusterSnapshot) -> Vec<AuditIssue> {
                 if let Some(destinations) = &route.route {
                     for dest in destinations {
                         let host = &dest.destination.host;
-                        if !is_host_resolvable(host, &vs_ns, &snapshot.existing_service_keys) {
-                            issues.push(AuditIssue {
-                                kind: "VirtualService".into(),
-                                resource: vs.name_any(),
-                                namespace: vs_ns.clone(),
-                                severity: IssueSeverity::Critical,
-                                description: format!(
-                                    "Битый маршрут: целевой хост '{}' не существует среди K8s Services",
-                                    host
-                                ),
-                            });
+
+                        // Если хост определен в ServiceEntry — маршрут валиден
+                        if snapshot.external_hosts.contains(host) {
+                            continue;
+                        }
+
+                        let resolved_key = resolve_service_key(host, &vs_ns);
+                        match resolved_key {
+                            Some(key) => {
+                                if !snapshot.existing_service_keys.contains(&key) {
+                                    issues.push(AuditIssue {
+                                        kind: "VirtualService".into(),
+                                        resource: vs.name_any(),
+                                        namespace: vs_ns.clone(),
+                                        severity: IssueSeverity::Critical,
+                                        description: format!(
+                                            "Битый маршрут: целевой Service '{}/{}' не существует",
+                                            key.namespace, key.name
+                                        ),
+                                    });
+                                } else {
+                                    // Проверка эндпоинтов (готовых подов)
+                                    let ready_pods = snapshot.service_ready_endpoints.get(&key).copied().unwrap_or(0);
+                                    if ready_pods == 0 {
+                                        issues.push(AuditIssue {
+                                            kind: "VirtualService".into(),
+                                            resource: vs.name_any(),
+                                            namespace: vs_ns.clone(),
+                                            severity: IssueSeverity::Critical,
+                                            description: format!(
+                                                "Маршрут в тупик (Dead End): у сервиса '{}/{}' ровно 0 Ready подов!",
+                                                key.namespace, key.name
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            None => {
+                                if !host.contains("cluster.local") && !host.contains('.') {
+                                    issues.push(AuditIssue {
+                                        kind: "VirtualService".into(),
+                                        resource: vs.name_any(),
+                                        namespace: vs_ns.clone(),
+                                        severity: IssueSeverity::Warning,
+                                        description: format!("Неразрешимый хост назначения '{}'", host),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -63,20 +100,14 @@ pub fn detect_orphans(snapshot: &ClusterSnapshot) -> Vec<AuditIssue> {
     issues
 }
 
-fn is_host_resolvable(host: &str, current_ns: &str, services: &HashSet<ResourceKey>) -> bool {
-    if host.contains("external") || host == "mesh" {
-        return true;
+fn resolve_service_key(host: &str, current_ns: &str) -> Option<ResourceKey> {
+    if host == "mesh" {
+        return None;
     }
-
     let parts: Vec<&str> = host.split('.').collect();
     match parts.len() {
-        1 => services.contains(&ResourceKey::new(current_ns, parts[0])),
-        2 => services.contains(&ResourceKey::new(parts[1], parts[0])),
-        _ => {
-            // Разбор FQDN вида name.namespace.svc.cluster.local
-            let name = parts[0];
-            let namespace = parts[1];
-            services.contains(&ResourceKey::new(namespace, name))
-        }
+        1 => Some(ResourceKey::new(current_ns, parts[0])),
+        2 => Some(ResourceKey::new(parts[1], parts[0])),
+        _ => Some(ResourceKey::new(parts[1], parts[0])),
     }
 }

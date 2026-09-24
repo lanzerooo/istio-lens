@@ -4,7 +4,7 @@ pub mod orphans;
 use crate::k8s::ClusterSnapshot;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum IssueSeverity {
     Warning,
     Critical,
@@ -29,8 +29,9 @@ impl<'a> Analyzer<'a> {
     }
 
     pub fn run_all(&self) -> (Vec<AuditIssue>, Vec<AuditIssue>) {
-        let duplicates = duplicates::detect_duplicates(self.snapshot);
-        let orphans = orphans::detect_orphans(self.snapshot);
-        (duplicates, orphans)
+        (
+            duplicates::detect_duplicates(self.snapshot),
+            orphans::detect_orphans(self.snapshot),
+        )
     }
 }

@@ -15,59 +15,136 @@ use crossterm::{
 use graph::TrafficGraph;
 use k8s::K8sDiscovery;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, panic, time::Duration};
+use std::{io, panic};
 use tui::{
-    app::{ActiveTab, AppState},
+    app::{ActiveTab, AppState, InputMode},
     event::{AppEvent, EventHandler},
     ui,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Сбор данных из кластера Kubernetes
-    println!("Инициализация подключения к Kubernetes...");
+    // 1. Сбор снимка состояния кластера
     let discovery = K8sDiscovery::new().await?;
-
-    println!("Получение конфигураций Istio и Service ресурсов...");
     let snapshot = discovery.fetch_snapshot().await?;
 
-    // 2. Статический анализ
+    // 2. Статический аудит
     let analyzer = Analyzer::new(&snapshot);
     let (duplicates, orphans) = analyzer.run_all();
 
-    // 3. Построение топологии
-    let topology = TrafficGraph::build(&snapshot);
+    // 3. Построение топологии трафика
+    let topology = TrafficGraph::build(&snapshot, None);
     let graph_display = topology.to_display_lines();
 
-    // 4. Инициализация TUI терминала
+    // 4. Инициализация терминала
     setup_panic_hook();
     let mut terminal = setup_terminal()?;
-    let mut events = EventHandler::new(Duration::from_millis(250));
-    let mut state = AppState::new(duplicates, orphans, graph_display);
+    let mut events = EventHandler::new();
+    let mut state = AppState::new(duplicates, orphans, graph_display, snapshot.namespaces.clone());
 
-    // 5. Главный цикл событий
+    // Флаг необходимости перерисовки кадра (0% CPU в простое)
+    let mut dirty = true;
+
+    // 5. Реактивный цикл событий
     while !state.should_quit {
-        terminal.draw(|f| ui::render(f, &mut state))?;
+        if dirty {
+            terminal.draw(|f| ui::render(f, &mut state))?;
+            dirty = false;
+        }
 
         if let Some(event) = events.next().await {
             match event {
-                AppEvent::Input(key) => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
-                    KeyCode::Tab => state.next_tab(),
-                    KeyCode::BackTab => state.prev_tab(),
-                    KeyCode::Char('1') => state.active_tab = ActiveTab::Duplicates,
-                    KeyCode::Char('2') => state.active_tab = ActiveTab::Orphans,
-                    KeyCode::Char('3') => state.active_tab = ActiveTab::TrafficGraph,
-                    KeyCode::Down | KeyCode::Char('j') => state.next_item(),
-                    KeyCode::Up | KeyCode::Char('k') => state.previous_item(),
-                    _ => {}
-                },
-                AppEvent::Tick => {}
+                AppEvent::Resize => {
+                    dirty = true;
+                }
+                AppEvent::Input(key) => {
+                    dirty = true;
+
+                    // Обработка текстового ввода в режиме поиска
+                    if state.input_mode == InputMode::Searching {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.search_query.clear();
+                                state.input_mode = InputMode::Normal;
+                                state.reset_selection();
+                            }
+                            KeyCode::Enter => {
+                                state.input_mode = InputMode::Normal;
+                                state.reset_selection();
+                            }
+                            KeyCode::Backspace => {
+                                state.search_query.pop();
+                                state.reset_selection();
+                            }
+                            KeyCode::Char(c) => {
+                                state.search_query.push(c);
+                                state.reset_selection();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Обработка выбора Namespace
+                    if state.input_mode == InputMode::NamespaceSelect {
+                        match key.code {
+                            KeyCode::Esc => state.input_mode = InputMode::Normal,
+                            KeyCode::Down | KeyCode::Char('j') => state.next_item(),
+                            KeyCode::Up | KeyCode::Char('k') => state.previous_item(),
+                            KeyCode::Enter => {
+                                state.selected_namespace = if state.ns_selector_index == 0 {
+                                    None
+                                } else {
+                                    state.namespaces.get(state.ns_selector_index - 1).cloned()
+                                };
+                                // Перестраиваем граф под выбранный namespace
+                                let new_top = TrafficGraph::build(&snapshot, state.selected_namespace.as_deref());
+                                state.graph_lines = new_top.to_display_lines();
+                                state.input_mode = InputMode::Normal;
+                                state.reset_selection();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Модальное окно деталей
+                    if state.show_details {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => state.show_details = false,
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Обычный режим навигации
+                    match key.code {
+                        KeyCode::Char('q') => state.should_quit = true,
+                        KeyCode::Char('/') => {
+                            state.input_mode = InputMode::Searching;
+                        }
+                        KeyCode::Char('n') => {
+                            state.input_mode = InputMode::NamespaceSelect;
+                        }
+                        KeyCode::Enter => {
+                            if state.active_tab != ActiveTab::TrafficGraph {
+                                state.show_details = true;
+                            }
+                        }
+                        KeyCode::Tab => state.next_tab(),
+                        KeyCode::BackTab => state.prev_tab(),
+                        KeyCode::Char('1') => state.active_tab = ActiveTab::Duplicates,
+                        KeyCode::Char('2') => state.active_tab = ActiveTab::Orphans,
+                        KeyCode::Char('3') => state.active_tab = ActiveTab::TrafficGraph,
+                        KeyCode::Down | KeyCode::Char('j') => state.next_item(),
+                        KeyCode::Up | KeyCode::Char('k') => state.previous_item(),
+                        _ => {}
+                    }
+                }
             }
         }
     }
 
-    // 6. Корректное завершение
     restore_terminal(&mut terminal)?;
     Ok(())
 }
