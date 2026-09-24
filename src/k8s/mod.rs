@@ -10,7 +10,6 @@ pub struct ClusterSnapshot {
     pub gateways: Vec<Gateway>,
     pub virtual_services: Vec<VirtualService>,
     pub destination_rules: Vec<DestinationRule>,
-    pub services: Vec<Service>,
     pub existing_service_keys: HashSet<ResourceKey>,
 }
 
@@ -32,7 +31,7 @@ impl K8sDiscovery {
 
         let lp = ListParams::default();
 
-        // Параллельный сбор ресурсов без блокировок
+        // Параллельный сбор ресурсов без взаимных блокировок
         let (gateways, virtual_services, destination_rules, services) = tokio::try_join!(
             gw_api.list(&lp),
             vs_api.list(&lp),
@@ -40,8 +39,9 @@ impl K8sDiscovery {
             svc_api.list(&lp)
         )?;
 
+        // Извлекаем ключи по значению, избегая лишнего клонирования
         let mut existing_service_keys = HashSet::new();
-        for svc in &services {
+        for svc in services.items {
             if let Some(ns) = svc.namespace() {
                 existing_service_keys.insert(ResourceKey::new(ns, svc.name_any()));
             }
@@ -51,7 +51,6 @@ impl K8sDiscovery {
             gateways: gateways.items,
             virtual_services: virtual_services.items,
             destination_rules: destination_rules.items,
-            services: services.items,
             existing_service_keys,
         })
     }
