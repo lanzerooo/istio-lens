@@ -1,4 +1,5 @@
 mod analyzer;
+mod diagnostics;
 mod error;
 mod graph;
 mod k8s;
@@ -12,8 +13,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use diagnostics::DiagnosticsCollector;
 use graph::TrafficGraph;
 use k8s::K8sDiscovery;
+use kube::Client;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{io, panic};
 use tui::{
@@ -24,21 +27,27 @@ use tui::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Инициализация подключения и сбор снимка ресурсов кластера
+    // 1. Инициализация подключения к Kubernetes
     println!("Подключение к Kubernetes через kubeconfig...");
+    let client = Client::try_default().await?;
     let discovery = K8sDiscovery::new().await?;
 
     println!("Сбор сетевых ресурсов (Gateways, VirtualServices, DestinationRules, Services, Pods)...");
     let snapshot = discovery.fetch_snapshot().await?;
 
-    // 2. Статический анализ дубликатов и неиспользуемых ресурсов
+    // 2. Сбор диагностических данных (Causal Incident Timeline, FinOps Tetris, Admission Webhooks)
+    println!("Сбор диагностических данных (Tetris, Webhooks, Timelines)...");
+    let diag_collector = DiagnosticsCollector::new(client);
+    let diag_snapshot = diag_collector.collect().await?;
+
+    // 3. Статический аудит дубликатов и сирот
     let analyzer = Analyzer::new(&snapshot);
     let (duplicates, orphans) = analyzer.run_all();
 
-    // 3. Построение сквозных цепочек трафика (Gateway -> Pods)
+    // 4. Построение сквозных цепочек трафика (Gateway -> Pods)
     let traces = TrafficGraph::build_traces(&snapshot, None);
 
-    // 4. Настройка терминала и перехват паники для безопасного завершения
+    // 5. Инициализация терминала и перехват паники для безопасного сброса
     setup_panic_hook();
     let mut terminal = setup_terminal()?;
     let mut events = EventHandler::new();
@@ -47,12 +56,15 @@ async fn main() -> anyhow::Result<()> {
         orphans,
         traces,
         snapshot.namespaces.clone(),
+        diag_snapshot.incidents,
+        diag_snapshot.node_profiles,
+        diag_snapshot.webhook_reports,
     );
 
-    // Флаг необходимости перерисовки (Event-driven: 0% CPU в простое)
+    // Флаг реактивной перерисовки (0% CPU в простое)
     let mut dirty = true;
 
-    // 5. Главный цикл обработки событий
+    // 6. Главный цикл событий
     while !state.should_quit {
         if dirty {
             terminal.draw(|f| ui::render(f, &mut state))?;
@@ -67,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
                 AppEvent::Input(key) => {
                     dirty = true;
 
-                    // 5.1. Режим строкового поиска и фильтрации
+                    // 6.1. Режим строкового поиска
                     if state.input_mode == InputMode::Searching {
                         match key.code {
                             KeyCode::Esc => {
@@ -92,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // 5.2. Модальный выбор Namespace Scope
+                    // 6.2. Модальный селектор Namespace Scope
                     if state.input_mode == InputMode::NamespaceSelect {
                         match key.code {
                             KeyCode::Esc => {
@@ -111,12 +123,11 @@ async fn main() -> anyhow::Result<()> {
                                     state.namespaces.get(state.ns_selector_index - 1).cloned()
                                 };
 
-                                // Перестраиваем маршруты под выбранный Namespace Scope
+                                // Перестраиваем граф трафика под выбранный Scope
                                 state.traces = TrafficGraph::build_traces(
                                     &snapshot,
                                     state.selected_namespace.as_deref(),
                                 );
-                                state.selected_trace_index = 0;
                                 state.input_mode = InputMode::Normal;
                                 state.reset_selection();
                             }
@@ -125,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // 5.3. Модальное окно просмотра манифеста и деталей
+                    // 6.3. Модальное окно просмотра манифеста
                     if state.show_details {
                         match key.code {
                             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
@@ -136,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // 5.4. Обычный режим навигации по интерфейсу
+                    // 6.4. Базовая навигация
                     match key.code {
                         KeyCode::Char('q') => {
                             state.should_quit = true;
@@ -148,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
                             state.input_mode = InputMode::NamespaceSelect;
                         }
                         KeyCode::Enter => {
-                            if state.active_tab != ActiveTab::TrafficGraph {
+                            if matches!(state.active_tab, ActiveTab::Duplicates | ActiveTab::Orphans) {
                                 state.show_details = true;
                             }
                         }
@@ -170,11 +181,33 @@ async fn main() -> anyhow::Result<()> {
                             state.active_tab = ActiveTab::TrafficGraph;
                             state.reset_selection();
                         }
+                        KeyCode::Char('4') => {
+                            state.active_tab = ActiveTab::IncidentTimeline;
+                            state.reset_selection();
+                        }
+                        KeyCode::Char('5') => {
+                            state.active_tab = ActiveTab::NodeTetris;
+                            state.reset_selection();
+                        }
+                        KeyCode::Char('6') => {
+                            state.active_tab = ActiveTab::WebhookAuditor;
+                            state.reset_selection();
+                        }
                         KeyCode::Down | KeyCode::Char('j') => {
                             state.next_item();
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             state.previous_item();
+                        }
+                        KeyCode::Char('d') => {
+                            if state.active_tab == ActiveTab::TrafficGraph {
+                                state.scroll_detail_down();
+                            }
+                        }
+                        KeyCode::Char('u') => {
+                            if state.active_tab == ActiveTab::TrafficGraph {
+                                state.scroll_detail_up();
+                            }
                         }
                         _ => {}
                     }
@@ -183,7 +216,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 6. Корректный сброс параметров терминала
     restore_terminal(&mut terminal)?;
     Ok(())
 }

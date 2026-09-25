@@ -1,14 +1,17 @@
 use super::app::{ActiveTab, AppState, InputMode};
+use super::diagnostics_ui;
 use crate::analyzer::IssueSeverity;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Tabs},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Tabs,
+    },
     Frame,
 };
 
-// Цветовая палитра Catppuccin Mocha
+// Палитра Catppuccin Mocha
 const COLOR_CRIT: Color = Color::Rgb(243, 139, 168);  // Red
 const COLOR_WARN: Color = Color::Rgb(250, 179, 135);  // Peach
 const COLOR_OK: Color = Color::Rgb(166, 227, 161);    // Green
@@ -22,9 +25,9 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4), // Карточки метрик (Summary)
-            Constraint::Length(3), // Вкладки
+            Constraint::Length(3), // Верхний бар вкладок
             Constraint::Min(10),   // Основное тело
-            Constraint::Length(1), // Хелп-бар или поле ввода
+            Constraint::Length(1), // Хелп-бар или строка поиска
         ])
         .split(f.size());
 
@@ -35,11 +38,13 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         ActiveTab::Duplicates => render_issues_table(f, state, chunks[2], true),
         ActiveTab::Orphans => render_issues_table(f, state, chunks[2], false),
         ActiveTab::TrafficGraph => render_graph_view(f, state, chunks[2]),
+        ActiveTab::IncidentTimeline => render_incidents_tab(f, state, chunks[2]),
+        ActiveTab::NodeTetris => diagnostics_ui::render_tetris_view(f, &state.node_profiles, chunks[2]),
+        ActiveTab::WebhookAuditor => diagnostics_ui::render_webhooks_view(f, &state.webhook_reports, chunks[2]),
     }
 
     render_footer(f, state, chunks[3]);
 
-    // Рендеринг оверлеев поверх интерфейса
     if state.input_mode == InputMode::NamespaceSelect {
         render_namespace_modal(f, state);
     } else if state.show_details {
@@ -63,12 +68,19 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
         .iter()
         .chain(&state.orphans)
         .filter(|i| i.severity == IssueSeverity::Critical)
-        .count();
+        .count()
+        + state.incidents.len();
 
-    let warn_count = state.duplicates.len() + state.orphans.len() - crit_count;
+    let warn_count = state.duplicates.len() + state.orphans.len()
+        - state
+            .duplicates
+            .iter()
+            .chain(&state.orphans)
+            .filter(|i| i.severity == IssueSeverity::Critical)
+            .count();
 
     let (health_text, health_col) = if crit_count > 0 {
-        ("CRITICAL", COLOR_CRIT)
+        ("DEGRADED", COLOR_CRIT)
     } else if warn_count > 0 {
         ("WARNING", COLOR_WARN)
     } else {
@@ -79,14 +91,17 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  ● ", Style::default().fg(health_col)),
-            Span::styled(health_text, Style::default().fg(health_col).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                health_text,
+                Style::default().fg(health_col).add_modifier(Modifier::BOLD),
+            ),
         ]),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Mesh Health ")
+            .title(" Cluster Health ")
             .border_style(Style::default().fg(COLOR_SURFACE)),
     );
     f.render_widget(p1, cards[0]);
@@ -94,7 +109,7 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
     let p2 = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  {} критических", crit_count),
+            format!("  {} критических / аварий", crit_count),
             Style::default().fg(COLOR_CRIT).add_modifier(Modifier::BOLD),
         )),
     ])
@@ -102,7 +117,7 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Critical ")
+            .title(" Critical & Crashes ")
             .border_style(Style::default().fg(COLOR_SURFACE)),
     );
     f.render_widget(p2, cards[1]);
@@ -142,11 +157,21 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_tabs(f: &mut Frame, state: &AppState, area: Rect) {
-    let titles = vec!["[1] Дубликаты", "[2] Неиспользуемые", "[3] Граф трафика"];
+    let titles = vec![
+        "[1] Дубликаты",
+        "[2] Неиспользуемые",
+        "[3] Граф трафика",
+        "[4] Инциденты",
+        "[5] FinOps Tetris",
+        "[6] Вебхуки",
+    ];
     let idx = match state.active_tab {
         ActiveTab::Duplicates => 0,
         ActiveTab::Orphans => 1,
         ActiveTab::TrafficGraph => 2,
+        ActiveTab::IncidentTimeline => 3,
+        ActiveTab::NodeTetris => 4,
+        ActiveTab::WebhookAuditor => 5,
     };
 
     let tabs = Tabs::new(titles)
@@ -154,11 +179,15 @@ fn render_tabs(f: &mut Frame, state: &AppState, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Istio Lens "),
+                .title(" Istio Lens & Kube-Forensics "),
         )
         .select(idx)
         .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .fg(COLOR_CYAN)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_widget(tabs, area);
 }
 
@@ -169,7 +198,10 @@ fn render_issues_table(f: &mut Frame, state: &mut AppState, area: Rect, is_dupli
         .iter()
         .map(|item| {
             let (label, style) = match item.severity {
-                IssueSeverity::Critical => ("CRIT", Style::default().fg(COLOR_CRIT).add_modifier(Modifier::BOLD)),
+                IssueSeverity::Critical => (
+                    "CRIT",
+                    Style::default().fg(COLOR_CRIT).add_modifier(Modifier::BOLD),
+                ),
                 IssueSeverity::Warning => ("WARN", Style::default().fg(COLOR_WARN)),
             };
 
@@ -201,14 +233,18 @@ fn render_issues_table(f: &mut Frame, state: &mut AppState, area: Rect, is_dupli
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Обнаруженные аномалии [Enter: детали, /: поиск] "),
+            .title(" Обнаруженные дефекты [Enter: детали, /: поиск] "),
     )
-    .highlight_style(Style::default().bg(COLOR_SURFACE).add_modifier(Modifier::BOLD));
+    .highlight_style(
+        Style::default()
+            .bg(COLOR_SURFACE)
+            .add_modifier(Modifier::BOLD),
+    );
 
     f.render_stateful_widget(table, area, &mut state.table_state);
 }
 
-fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
+fn render_graph_view(f: &mut Frame, state: &mut AppState, area: Rect) {
     if state.traces.is_empty() {
         let empty = Paragraph::new(" Маршруты не найдены для выбранного namespace.")
             .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Граф трафика "));
@@ -221,42 +257,40 @@ fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
         .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(area);
 
-    // 1. Левая колонка: список маршрутов
-    let items: Vec<Line> = state
+    let items: Vec<ListItem> = state
         .traces
         .iter()
-        .enumerate()
-        .map(|(idx, trace)| {
-            let is_sel = idx == state.selected_trace_index;
-            let prefix = if is_sel { "▶ " } else { "  " };
-            let style = if is_sel {
-                Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(COLOR_TEXT)
-            };
-
-            Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(format!("{}/{}", trace.vs_namespace, trace.vs_name), style),
+        .map(|trace| {
+            let line = Line::from(vec![
+                Span::styled(format!("{}/{}", trace.vs_namespace, trace.vs_name), Style::default().fg(COLOR_TEXT)),
                 Span::styled(format!(" [{}]", trace.uri_match), Style::default().fg(Color::DarkGray)),
-            ])
+            ]);
+            ListItem::new(line)
         })
         .collect();
 
-    let list = Paragraph::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(" Маршруты (↑/↓ для выбора) ")
-            .border_style(Style::default().fg(COLOR_SURFACE)),
-    );
-    f.render_widget(list, cols[0]);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Маршруты (↑/↓) ")
+                .border_style(Style::default().fg(COLOR_SURFACE)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(COLOR_SURFACE)
+                .fg(COLOR_CYAN)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
-    // 2. Правая колонка: сквозной Hop-пайплайн
+    f.render_stateful_widget(list, cols[0], &mut state.route_list_state);
+
     let current_trace = &state.traces[state.selected_trace_index];
     let mut canvas = Vec::new();
 
-    // Блок 1: Gateway
+    // 1. Gateway
     canvas.push(Line::from(vec![
         Span::styled("┌── 🌐 1. GATEWAY ────────────────────────────────────────────────────────┐", Style::default().fg(COLOR_CYAN)),
     ]));
@@ -275,7 +309,7 @@ fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
     canvas.push(Line::from(Span::styled("    │  (Ingress Routing Rule)", Style::default().fg(Color::DarkGray))));
     canvas.push(Line::from(Span::styled("    ▼", Style::default().fg(COLOR_BLUE))));
 
-    // Блок 2: VirtualService
+    // 2. VirtualService
     canvas.push(Line::from(vec![
         Span::styled("┌── 🔀 2. VIRTUAL SERVICE ───────────────────────────────────────────────┐", Style::default().fg(COLOR_BLUE)),
     ]));
@@ -296,7 +330,7 @@ fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
     canvas.push(Line::from(Span::styled("    │  (Forward to K8s Service)", Style::default().fg(Color::DarkGray))));
     canvas.push(Line::from(Span::styled("    ▼", Style::default().fg(COLOR_OK))));
 
-    // Блок 3: K8s Service & Destinations
+    // 3. Service & DR
     for target in &current_trace.targets {
         let (port_str, selector_str) = match &target.service_meta {
             Some(meta) => {
@@ -339,7 +373,7 @@ fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
         canvas.push(Line::from(Span::styled("    │  (Endpoint Label Selection)", Style::default().fg(Color::DarkGray))));
         canvas.push(Line::from(Span::styled("    ▼", Style::default().fg(Color::Magenta))));
 
-        // Блок 4: Pods
+        // 4. Pods
         let ready_count = target.matching_pods.iter().filter(|p| p.is_ready).count();
         let total_count = target.matching_pods.len();
 
@@ -364,7 +398,7 @@ fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
                 Span::styled("│  ✖ ВНИМАНИЕ: Нет подов, удовлетворяющих селекторам сервиса и сабсета!", Style::default().fg(COLOR_CRIT)),
             ]));
         } else {
-            for pod in target.matching_pods.iter().take(4) {
+            for pod in &target.matching_pods {
                 let badge = if pod.is_ready { "[Ready 1/1]" } else { "[Not Ready]" };
                 let b_style = if pod.is_ready { Style::default().fg(COLOR_OK) } else { Style::default().fg(COLOR_CRIT) };
 
@@ -375,11 +409,6 @@ fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
                     Span::styled(badge, b_style),
                 ]));
             }
-            if target.matching_pods.len() > 4 {
-                canvas.push(Line::from(vec![
-                    Span::styled(format!("│  ... и еще {} подов скрыто", target.matching_pods.len() - 4), Style::default().fg(Color::DarkGray)),
-                ]));
-            }
         }
 
         canvas.push(Line::from(vec![
@@ -387,20 +416,85 @@ fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
         ]));
     }
 
-    let detail = Paragraph::new(canvas).block(
+    let detail = Paragraph::new(canvas)
+        .scroll((state.trace_detail_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Сквозной маршрут трафика (d/u: скролл деталей) ")
+                .border_style(Style::default().fg(COLOR_SURFACE)),
+        );
+    f.render_widget(detail, cols[1]);
+}
+
+fn render_incidents_tab(f: &mut Frame, state: &mut AppState, area: Rect) {
+    if state.incidents.is_empty() {
+        let empty = Paragraph::new(" Инцидентов с аварийным падением подов / OOM-Killer не обнаружено.")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Causal Incident Timeline ")
+                    .border_style(Style::default().fg(COLOR_SURFACE)),
+            );
+        f.render_widget(empty, area);
+        return;
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(area);
+
+    let selected_idx = state
+        .table_state
+        .selected()
+        .unwrap_or(0)
+        .min(state.incidents.len().saturating_sub(1));
+
+    // Отображаем список аварийных подов как Table, согласуясь с TableState
+    let rows: Vec<Row> = state
+        .incidents
+        .iter()
+        .map(|inc| {
+            let code_str = inc.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+            Row::new(vec![
+                Cell::from(format!("{}/{}", inc.namespace, inc.pod_name)).style(Style::default().fg(COLOR_TEXT)),
+                Cell::from(format!("[Exit: {}]", code_str)).style(Style::default().fg(COLOR_CRIT).add_modifier(Modifier::BOLD)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [Constraint::Percentage(70), Constraint::Percentage(30)],
+    )
+    .block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Сквозной маршрут трафика: Gateway -> Pod ")
+            .title(" Аварийные поды (↑/↓) ")
             .border_style(Style::default().fg(COLOR_SURFACE)),
-    );
-    f.render_widget(detail, cols[1]);
+    )
+    .highlight_style(
+        Style::default()
+            .bg(COLOR_SURFACE)
+            .fg(COLOR_CYAN)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(table, cols[0], &mut state.table_state);
+
+    let current_incident = &state.incidents[selected_idx];
+    diagnostics_ui::render_incident_view(f, current_incident, cols[1]);
 }
 
 fn render_footer(f: &mut Frame, state: &AppState, area: Rect) {
     let content = match state.input_mode {
         InputMode::Searching => format!(" ПОИСК: {}█ (Esc: отмена, Enter: применить)", state.search_query),
-        _ => " [q] Выход | [/] Поиск | [n] Scope | [Enter] Детали | [Tab/1-3] Вкладки | [j/k] Навигация ".into(),
+        _ => " [q] Выход | [/] Поиск | [n] Scope | [Enter] Детали | [Tab / 1-6] Вкладки | [j/k] Навигация ".into(),
     };
 
     let style = if state.input_mode == InputMode::Searching {
