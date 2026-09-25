@@ -1,7 +1,17 @@
 use kube::CustomResource;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+
+/// Безопасная десериализация: обрабатывает как отсутствие поля, так и явный `null`
+pub fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
 
 #[derive(CustomResource, Serialize, Deserialize, Default, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
@@ -19,6 +29,7 @@ pub struct GatewaySpec {
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Server {
     pub port: Option<Port>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub hosts: Vec<String>,
 }
 
@@ -38,6 +49,7 @@ pub struct Port {
     namespaced
 )]
 pub struct VirtualServiceSpec {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub hosts: Vec<String>,
     pub gateways: Option<Vec<String>>,
     pub http: Option<Vec<HttpRoute>>,
@@ -90,6 +102,7 @@ pub struct PortSelector {
     namespaced
 )]
 pub struct DestinationRuleSpec {
+    #[serde(default)]
     pub host: String,
     pub subsets: Option<Vec<Subset>>,
 }
@@ -100,7 +113,6 @@ pub struct Subset {
     pub labels: Option<BTreeMap<String, String>>,
 }
 
-/// Поддержка ServiceEntry для учета внешних сервисов Mesh
 #[derive(CustomResource, Serialize, Deserialize, Default, Clone, Debug, PartialEq, JsonSchema)]
 #[kube(
     group = "networking.istio.io",
@@ -110,6 +122,7 @@ pub struct Subset {
     namespaced
 )]
 pub struct ServiceEntrySpec {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub hosts: Vec<String>,
     pub location: Option<String>,
     pub resolution: Option<String>,
