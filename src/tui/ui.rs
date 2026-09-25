@@ -1,7 +1,7 @@
 use super::app::{ActiveTab, AppState, InputMode};
 use crate::analyzer::IssueSeverity;
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Tabs},
@@ -58,13 +58,15 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
         ])
         .split(area);
 
-    let crit_count = state.duplicates.iter().chain(&state.orphans)
+    let crit_count = state
+        .duplicates
+        .iter()
+        .chain(&state.orphans)
         .filter(|i| i.severity == IssueSeverity::Critical)
         .count();
 
     let warn_count = state.duplicates.len() + state.orphans.len() - crit_count;
 
-    // Card 1: Mesh Health
     let (health_text, health_col) = if crit_count > 0 {
         ("CRITICAL", COLOR_CRIT)
     } else if warn_count > 0 {
@@ -89,7 +91,6 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
     );
     f.render_widget(p1, cards[0]);
 
-    // Card 2: Critical issues
     let p2 = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -106,7 +107,6 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
     );
     f.render_widget(p2, cards[1]);
 
-    // Card 3: Warnings
     let p3 = Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -123,7 +123,6 @@ fn render_summary_cards(f: &mut Frame, state: &AppState, area: Rect) {
     );
     f.render_widget(p3, cards[2]);
 
-    // Card 4: Namespace Filter
     let ns_label = state.selected_namespace.as_deref().unwrap_or("All Namespaces");
     let p4 = Paragraph::new(vec![
         Line::from(""),
@@ -210,33 +209,192 @@ fn render_issues_table(f: &mut Frame, state: &mut AppState, area: Rect, is_dupli
 }
 
 fn render_graph_view(f: &mut Frame, state: &AppState, area: Rect) {
-    let visible_lines: Vec<Line> = state
-        .graph_lines
+    if state.traces.is_empty() {
+        let empty = Paragraph::new(" Маршруты не найдены для выбранного namespace.")
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Граф трафика "));
+        f.render_widget(empty, area);
+        return;
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(area);
+
+    // 1. Левая колонка: список маршрутов
+    let items: Vec<Line> = state
+        .traces
         .iter()
-        .skip(state.graph_scroll)
-        .map(|l| {
-            let col = if l.contains("Gateway") {
-                COLOR_CYAN
-            } else if l.contains("VirtualService") {
-                COLOR_BLUE
-            } else if l.contains("0 endpoints") {
-                COLOR_CRIT
-            } else if l.contains("ServiceEntry") {
-                COLOR_WARN
+        .enumerate()
+        .map(|(idx, trace)| {
+            let is_sel = idx == state.selected_trace_index;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let style = if is_sel {
+                Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)
             } else {
-                COLOR_OK
+                Style::default().fg(COLOR_TEXT)
             };
-            Line::from(Span::styled(l, Style::default().fg(col)))
+
+            Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(format!("{}/{}", trace.vs_namespace, trace.vs_name), style),
+                Span::styled(format!(" [{}]", trace.uri_match), Style::default().fg(Color::DarkGray)),
+            ])
         })
         .collect();
 
-    let paragraph = Paragraph::new(visible_lines).block(
+    let list = Paragraph::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Топология трафика: Ingress Gateway -> VirtualService -> Service -> Subsets "),
+            .title(" Маршруты (↑/↓ для выбора) ")
+            .border_style(Style::default().fg(COLOR_SURFACE)),
     );
-    f.render_widget(paragraph, area);
+    f.render_widget(list, cols[0]);
+
+    // 2. Правая колонка: сквозной Hop-пайплайн
+    let current_trace = &state.traces[state.selected_trace_index];
+    let mut canvas = Vec::new();
+
+    // Блок 1: Gateway
+    canvas.push(Line::from(vec![
+        Span::styled("┌── 🌐 1. GATEWAY ────────────────────────────────────────────────────────┐", Style::default().fg(COLOR_CYAN)),
+    ]));
+    canvas.push(Line::from(vec![
+        Span::styled("│  Name:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&current_trace.gateway_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+    ]));
+    canvas.push(Line::from(vec![
+        Span::styled("│  Hosts: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(current_trace.gateway_hosts.join(", "), Style::default().fg(COLOR_CYAN)),
+    ]));
+    canvas.push(Line::from(vec![
+        Span::styled("└───┬────────────────────────────────────────────────────────────────────┘", Style::default().fg(COLOR_CYAN)),
+    ]));
+
+    canvas.push(Line::from(Span::styled("    │  (Ingress Routing Rule)", Style::default().fg(Color::DarkGray))));
+    canvas.push(Line::from(Span::styled("    ▼", Style::default().fg(COLOR_BLUE))));
+
+    // Блок 2: VirtualService
+    canvas.push(Line::from(vec![
+        Span::styled("┌── 🔀 2. VIRTUAL SERVICE ───────────────────────────────────────────────┐", Style::default().fg(COLOR_BLUE)),
+    ]));
+    canvas.push(Line::from(vec![
+        Span::styled("│  Name:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}/{}", current_trace.vs_namespace, current_trace.vs_name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+    ]));
+    canvas.push(Line::from(vec![
+        Span::styled("│  Match: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&current_trace.uri_match, Style::default().fg(COLOR_WARN).add_modifier(Modifier::BOLD)),
+        Span::styled(" ──► Target: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&current_trace.service_host, Style::default().fg(COLOR_OK)),
+    ]));
+    canvas.push(Line::from(vec![
+        Span::styled("└───┬────────────────────────────────────────────────────────────────────┘", Style::default().fg(COLOR_BLUE)),
+    ]));
+
+    canvas.push(Line::from(Span::styled("    │  (Forward to K8s Service)", Style::default().fg(Color::DarkGray))));
+    canvas.push(Line::from(Span::styled("    ▼", Style::default().fg(COLOR_OK))));
+
+    // Блок 3: K8s Service & Destinations
+    for target in &current_trace.targets {
+        let (port_str, selector_str) = match &target.service_meta {
+            Some(meta) => {
+                let p = if meta.ports.is_empty() { "default".into() } else { meta.ports.join(", ") };
+                let s = if meta.selector.is_empty() {
+                    "No selector".into()
+                } else {
+                    meta.selector.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ")
+                };
+                (p, s)
+            }
+            None => ("Unknown".into(), "External / No Service".into()),
+        };
+
+        canvas.push(Line::from(vec![
+            Span::styled("┌── ⚙️  3. K8S SERVICE & ROUTE TARGET ─────────────────────────────────────┐", Style::default().fg(COLOR_OK)),
+        ]));
+        canvas.push(Line::from(vec![
+            Span::styled("│  Host:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&current_trace.service_host, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" | Ports: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(port_str, Style::default().fg(COLOR_CYAN)),
+        ]));
+        canvas.push(Line::from(vec![
+            Span::styled("│  Selector: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(selector_str, Style::default().fg(COLOR_TEXT)),
+        ]));
+        canvas.push(Line::from(vec![
+            Span::styled("│  Policy:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("DestinationRule: {} | Subset: '{}' | Weight: {}%", 
+                target.destination_rule.as_deref().unwrap_or("None"),
+                target.subset_name,
+                target.weight
+            ), Style::default().fg(COLOR_WARN)),
+        ]));
+        canvas.push(Line::from(vec![
+            Span::styled("└───┬────────────────────────────────────────────────────────────────────┘", Style::default().fg(COLOR_OK)),
+        ]));
+
+        canvas.push(Line::from(Span::styled("    │  (Endpoint Label Selection)", Style::default().fg(Color::DarkGray))));
+        canvas.push(Line::from(Span::styled("    ▼", Style::default().fg(Color::Magenta))));
+
+        // Блок 4: Pods
+        let ready_count = target.matching_pods.iter().filter(|p| p.is_ready).count();
+        let total_count = target.matching_pods.len();
+
+        let (pod_col, pod_status_text) = if total_count == 0 {
+            (COLOR_CRIT, "✖ 0 подов найдено (Dead End!)")
+        } else if ready_count < total_count {
+            (COLOR_WARN, "▲ Частичная деградация подов")
+        } else {
+            (COLOR_OK, "● Все реплики здоровы")
+        };
+
+        canvas.push(Line::from(vec![
+            Span::styled("┌── 📦 4. APPLICATION PODS & WORKLOADS ───────────────────────────────────┐", Style::default().fg(pod_col)),
+        ]));
+        canvas.push(Line::from(vec![
+            Span::styled("│  Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} (Ready: {}/{})", pod_status_text, ready_count, total_count), Style::default().fg(pod_col).add_modifier(Modifier::BOLD)),
+        ]));
+
+        if target.matching_pods.is_empty() {
+            canvas.push(Line::from(vec![
+                Span::styled("│  ✖ ВНИМАНИЕ: Нет подов, удовлетворяющих селекторам сервиса и сабсета!", Style::default().fg(COLOR_CRIT)),
+            ]));
+        } else {
+            for pod in target.matching_pods.iter().take(4) {
+                let badge = if pod.is_ready { "[Ready 1/1]" } else { "[Not Ready]" };
+                let b_style = if pod.is_ready { Style::default().fg(COLOR_OK) } else { Style::default().fg(COLOR_CRIT) };
+
+                canvas.push(Line::from(vec![
+                    Span::styled("│  • Pod: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{:<30}", pod.name), Style::default().fg(Color::White)),
+                    Span::styled(format!(" Phase: {:<9} ", pod.phase), Style::default().fg(COLOR_TEXT)),
+                    Span::styled(badge, b_style),
+                ]));
+            }
+            if target.matching_pods.len() > 4 {
+                canvas.push(Line::from(vec![
+                    Span::styled(format!("│  ... и еще {} подов скрыто", target.matching_pods.len() - 4), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+        }
+
+        canvas.push(Line::from(vec![
+            Span::styled("└────────────────────────────────────────────────────────────────────────┘", Style::default().fg(pod_col)),
+        ]));
+    }
+
+    let detail = Paragraph::new(canvas).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Сквозной маршрут трафика: Gateway -> Pod ")
+            .border_style(Style::default().fg(COLOR_SURFACE)),
+    );
+    f.render_widget(detail, cols[1]);
 }
 
 fn render_footer(f: &mut Frame, state: &AppState, area: Rect) {
@@ -254,7 +412,6 @@ fn render_footer(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(Paragraph::new(content).style(style), area);
 }
 
-/// Модальное окно выбора Namespace
 fn render_namespace_modal(f: &mut Frame, state: &AppState) {
     let area = centered_rect(50, 60, f.size());
     f.render_widget(Clear, area);
@@ -287,7 +444,6 @@ fn render_namespace_modal(f: &mut Frame, state: &AppState) {
     f.render_widget(block, area);
 }
 
-/// Модальное окно просмотра деталей и сырого YAML
 fn render_details_modal(f: &mut Frame, state: &AppState) {
     let area = centered_rect(70, 70, f.size());
     f.render_widget(Clear, area);

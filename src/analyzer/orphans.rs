@@ -34,7 +34,7 @@ pub fn detect_orphans(snapshot: &ClusterSnapshot) -> Vec<AuditIssue> {
         }
     }
 
-    // 2. Валидация маршрутов VS: существование сервиса + Ready Endpoints
+    // 2. Валидация маршрутов VS: существование сервиса + Ready поды
     for vs in &snapshot.virtual_services {
         let vs_ns = vs.namespace().unwrap_or_else(|| "default".into());
         if let Some(http_routes) = &vs.spec.http {
@@ -43,7 +43,7 @@ pub fn detect_orphans(snapshot: &ClusterSnapshot) -> Vec<AuditIssue> {
                     for dest in destinations {
                         let host = &dest.destination.host;
 
-                        // Если хост определен в ServiceEntry — маршрут валиден
+                        // Если хост определен в ServiceEntry — маршрут легитимен
                         if snapshot.external_hosts.contains(host) {
                             continue;
                         }
@@ -63,8 +63,26 @@ pub fn detect_orphans(snapshot: &ClusterSnapshot) -> Vec<AuditIssue> {
                                         ),
                                     });
                                 } else {
-                                    // Проверка эндпоинтов (готовых подов)
-                                    let ready_pods = snapshot.service_ready_endpoints.get(&key).copied().unwrap_or(0);
+                                    // Подсчет готовых подов по селекторам сервиса
+                                    let ready_pods = if let Some(meta) = snapshot.services_meta.get(&key) {
+                                        if meta.selector.is_empty() {
+                                            // Сервис без селектора (ExternalName или ручные Endpoints)
+                                            1
+                                        } else {
+                                            snapshot
+                                                .pods
+                                                .iter()
+                                                .filter(|p| {
+                                                    p.namespace == key.namespace
+                                                        && p.is_ready
+                                                        && meta.selector.iter().all(|(k, v)| p.labels.get(k) == Some(v))
+                                                })
+                                                .count()
+                                        }
+                                    } else {
+                                        0
+                                    };
+
                                     if ready_pods == 0 {
                                         issues.push(AuditIssue {
                                             kind: "VirtualService".into(),

@@ -1,110 +1,121 @@
-use crate::k8s::ClusterSnapshot;
+use crate::k8s::{ClusterSnapshot, PodInfo, ServiceMeta};
 use crate::model::ResourceKey;
 use kube::ResourceExt;
-use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TopologyNode {
-    Gateway(String),
-    VirtualService(String),
-    Service { name: String, ready_endpoints: usize },
-    ServiceEntry(String),
-    DestinationRule { name: String, subsets: Vec<String> },
+#[derive(Clone, Debug)]
+pub struct RouteTrace {
+    pub gateway_name: String,
+    pub gateway_hosts: Vec<String>,
+    pub vs_name: String,
+    pub vs_namespace: String,
+    pub uri_match: String,
+    pub service_host: String,
+    pub targets: Vec<SubnetTarget>,
 }
 
-impl TopologyNode {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Gateway(name) => format!("🌐 Gateway [{}]", name),
-            Self::VirtualService(name) => format!("🔀 VirtualService [{}]", name),
-            Self::Service { name, ready_endpoints } => {
-                let status = if *ready_endpoints > 0 {
-                    format!("● {} ready", ready_endpoints)
-                } else {
-                    "✖ 0 endpoints".to_string()
-                };
-                format!("⚙️  Service [{}] ({})", name, status)
-            }
-            Self::ServiceEntry(name) => format!("🌍 ServiceEntry [{}]", name),
-            Self::DestinationRule { name, subsets } => {
-                let sub_str = if subsets.is_empty() {
-                    "default".into()
-                } else {
-                    subsets.join(", ")
-                };
-                format!("🎯 DestinationRule [{}] (subsets: {})", name, sub_str)
-            }
-        }
-    }
+#[derive(Clone, Debug)]
+pub struct SubnetTarget {
+    pub subset_name: String,
+    pub weight: i32,
+    pub destination_rule: Option<String>,
+    pub service_meta: Option<ServiceMeta>,
+    pub matching_pods: Vec<PodInfo>,
 }
 
-pub struct TrafficGraph {
-    pub graph: DiGraph<TopologyNode, &'static str>,
-}
+pub struct TrafficGraph;
 
 impl TrafficGraph {
-    pub fn build(snapshot: &ClusterSnapshot, filter_ns: Option<&str>) -> Self {
-        let mut graph = DiGraph::new();
-        let mut node_indices: HashMap<String, NodeIndex> = HashMap::new();
+    pub fn build_traces(snapshot: &ClusterSnapshot, filter_ns: Option<&str>) -> Vec<RouteTrace> {
+        let mut traces = Vec::new();
 
-        // 1. Gateway Nodes
-        for gw in &snapshot.gateways {
-            if filter_ns.is_some() && gw.namespace().as_deref() != filter_ns {
-                continue;
-            }
-            let key = format!("gw:{}/{}", gw.namespace().unwrap_or_default(), gw.name_any());
-            let idx = graph.add_node(TopologyNode::Gateway(gw.name_any()));
-            node_indices.insert(key, idx);
-        }
-
-        // 2. VirtualServices
         for vs in &snapshot.virtual_services {
             let vs_ns = vs.namespace().unwrap_or_default();
             if filter_ns.is_some() && vs.namespace().as_deref() != filter_ns {
                 continue;
             }
-            let vs_key = format!("vs:{}/{}", vs_ns, vs.name_any());
-            let vs_idx = graph.add_node(TopologyNode::VirtualService(vs.name_any()));
-            node_indices.insert(vs_key, vs_idx);
 
-            // Связываем со шлюзами
-            if let Some(gws) = &vs.spec.gateways {
-                for gw_name in gws {
-                    let cleaned = gw_name.split('/').last().unwrap_or(gw_name);
-                    let gw_full_key = format!("gw:{}/{}", vs_ns, cleaned);
-                    if let Some(&gw_idx) = node_indices.get(&gw_full_key) {
-                        graph.add_edge(gw_idx, vs_idx, "routes");
-                    }
-                }
-            }
+            let gws = vs.spec.gateways.clone().unwrap_or_else(|| vec!["mesh".into()]);
 
-            // Связываем с сервисами и ServiceEntry
-            if let Some(http) = &vs.spec.http {
-                for route in http {
+            if let Some(http_routes) = &vs.spec.http {
+                for route in http_routes {
+                    let uri_match = route
+                        .r#match
+                        .as_ref()
+                        .and_then(|m| m.first())
+                        .and_then(|m| m.uri.as_ref())
+                        .map(|u| match u {
+                            crate::model::StringMatch::Exact(s) => format!("Exact({})", s),
+                            crate::model::StringMatch::Prefix(s) => format!("Prefix({})", s),
+                            crate::model::StringMatch::Regex(s) => format!("Regex({})", s),
+                        })
+                        .unwrap_or_else(|| "/* (All)".into());
+
                     if let Some(destinations) = &route.route {
                         for dest in destinations {
                             let host = &dest.destination.host;
+                            let subset_req = dest.destination.subset.clone();
+                            let weight = dest.weight.unwrap_or(100);
 
-                            if snapshot.external_hosts.contains(host) {
-                                let se_key = format!("se:{}", host);
-                                let se_idx = *node_indices
-                                    .entry(se_key)
-                                    .or_insert_with(|| graph.add_node(TopologyNode::ServiceEntry(host.clone())));
-                                graph.add_edge(vs_idx, se_idx, "external");
-                            } else {
-                                let svc_name = host.split('.').next().unwrap_or(host);
-                                let svc_res_key = ResourceKey::new(&vs_ns, svc_name);
-                                let ready = snapshot.service_ready_endpoints.get(&svc_res_key).copied().unwrap_or(0);
-                                let svc_key = format!("svc:{}/{}", vs_ns, svc_name);
+                            // Поиск метаданных Service
+                            let svc_name = host.split('.').next().unwrap_or(host);
+                            let svc_key = ResourceKey::new(&vs_ns, svc_name);
+                            let svc_meta = snapshot.services_meta.get(&svc_key).cloned();
 
-                                let svc_idx = *node_indices.entry(svc_key.clone()).or_insert_with(|| {
-                                    graph.add_node(TopologyNode::Service {
-                                        name: svc_name.to_string(),
-                                        ready_endpoints: ready,
-                                    })
+                            // Поиск DestinationRule для этого хоста
+                            let dr = snapshot.destination_rules.iter().find(|d| {
+                                d.spec.host == *host || d.spec.host.starts_with(svc_name)
+                            });
+
+                            // Определение селекторов пода
+                            let mut target_selector = BTreeMap::new();
+                            if let Some(ref meta) = svc_meta {
+                                target_selector.extend(meta.selector.clone());
+                            }
+
+                            if let Some(dr_rule) = dr {
+                                if let Some(ref sub_name) = subset_req {
+                                    if let Some(subsets) = &dr_rule.spec.subsets {
+                                        if let Some(found_sub) = subsets.iter().find(|s| s.name == *sub_name) {
+                                            if let Some(labels) = &found_sub.labels {
+                                                target_selector.extend(labels.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Поиск реальных подов, подходящих под селекторы
+                            let mut matching_pods = Vec::new();
+                            if !target_selector.is_empty() {
+                                for pod in &snapshot.pods {
+                                    if pod.namespace == vs_ns {
+                                        let all_match = target_selector.iter().all(|(k, v)| {
+                                            pod.labels.get(k) == Some(v)
+                                        });
+                                        if all_match {
+                                            matching_pods.push(pod.clone());
+                                        }
+                                    }
+                                }
+                            }
+
+                            for gw in &gws {
+                                traces.push(RouteTrace {
+                                    gateway_name: gw.clone(),
+                                    gateway_hosts: vs.spec.hosts.clone(),
+                                    vs_name: vs.name_any(),
+                                    vs_namespace: vs_ns.clone(),
+                                    uri_match: uri_match.clone(),
+                                    service_host: host.clone(),
+                                    targets: vec![SubnetTarget {
+                                        subset_name: subset_req.clone().unwrap_or_else(|| "default".into()),
+                                        weight,
+                                        destination_rule: dr.map(|d| d.name_any()),
+                                        service_meta: svc_meta.clone(),
+                                        matching_pods: matching_pods.clone(), 
+                                    }],
                                 });
-                                graph.add_edge(vs_idx, svc_idx, "forwards");
                             }
                         }
                     }
@@ -112,67 +123,6 @@ impl TrafficGraph {
             }
         }
 
-        // 3. DestinationRules
-        for dr in &snapshot.destination_rules {
-            let dr_ns = dr.namespace().unwrap_or_default();
-            if filter_ns.is_some() && dr.namespace().as_deref() != filter_ns {
-                continue;
-            }
-            let svc_name = dr.spec.host.split('.').next().unwrap_or(&dr.spec.host);
-            let svc_key = format!("svc:{}/{}", dr_ns, svc_name);
-
-            let subsets = dr
-                .spec
-                .subsets
-                .as_ref()
-                .map(|s| s.iter().map(|sub| sub.name.clone()).collect())
-                .unwrap_or_default();
-
-            let dr_idx = graph.add_node(TopologyNode::DestinationRule {
-                name: dr.name_any(),
-                subsets,
-            });
-
-            if let Some(&svc_idx) = node_indices.get(&svc_key) {
-                graph.add_edge(svc_idx, dr_idx, "policy");
-            }
-        }
-
-        Self { graph }
-    }
-
-    pub fn to_display_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        for node_idx in self.graph.node_indices() {
-            if matches!(self.graph[node_idx], TopologyNode::Gateway(_)) {
-                self.dfs_format(node_idx, 0, &mut lines, &mut Vec::new());
-            }
-        }
-        if lines.is_empty() {
-            lines.push("Маршруты не найдены для выбранного фильтра namespace.".into());
-        }
-        lines
-    }
-
-    fn dfs_format(
-        &self,
-        curr: NodeIndex,
-        depth: usize,
-        lines: &mut Vec<String>,
-        visited: &mut Vec<NodeIndex>,
-    ) {
-        if visited.contains(&curr) {
-            lines.push(format!("{}└── 🔄 [Обнаружен цикл в роутинге]", "   ".repeat(depth)));
-            return;
-        }
-
-        visited.push(curr);
-        let prefix = if depth == 0 { "" } else { "└── " };
-        lines.push(format!("{}{}{}", "   ".repeat(depth), prefix, self.graph[curr].label()));
-
-        for neighbor in self.graph.neighbors(curr) {
-            self.dfs_format(neighbor, depth + 1, lines, visited);
-        }
-        visited.pop();
+        traces
     }
 }

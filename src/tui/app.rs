@@ -1,4 +1,5 @@
 use crate::analyzer::AuditIssue;
+use crate::graph::RouteTrace;
 use ratatui::widgets::TableState;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -20,20 +21,15 @@ pub struct AppState {
     pub input_mode: InputMode,
     pub duplicates: Vec<AuditIssue>,
     pub orphans: Vec<AuditIssue>,
-    pub graph_lines: Vec<String>,
+    pub traces: Vec<RouteTrace>,
+    pub selected_trace_index: usize,
     pub table_state: TableState,
-    pub graph_scroll: usize,
     pub should_quit: bool,
 
-    // Поиск и фильтрация
     pub search_query: String,
-
-    // Namespace Selector
     pub namespaces: Vec<String>,
     pub selected_namespace: Option<String>,
     pub ns_selector_index: usize,
-
-    // Details Modal
     pub show_details: bool,
 }
 
@@ -41,7 +37,7 @@ impl AppState {
     pub fn new(
         duplicates: Vec<AuditIssue>,
         orphans: Vec<AuditIssue>,
-        graph_lines: Vec<String>,
+        traces: Vec<RouteTrace>,
         namespaces: Vec<String>,
     ) -> Self {
         let mut table_state = TableState::default();
@@ -54,13 +50,13 @@ impl AppState {
             input_mode: InputMode::Normal,
             duplicates,
             orphans,
-            graph_lines,
+            traces,
+            selected_trace_index: 0,
             table_state,
-            graph_scroll: 0,
             should_quit: false,
             search_query: String::new(),
             namespaces,
-            selected_namespace: None, // None = All Namespaces
+            selected_namespace: None,
             ns_selector_index: 0,
             show_details: false,
         }
@@ -82,10 +78,10 @@ impl AppState {
                     }
                 }
                 if !self.search_query.is_empty() {
-                    let query = self.search_query.to_lowercase();
-                    return issue.resource.to_lowercase().contains(&query)
-                        || issue.namespace.to_lowercase().contains(&query)
-                        || issue.description.to_lowercase().contains(&query);
+                    let q = self.search_query.to_lowercase();
+                    return issue.resource.to_lowercase().contains(&q)
+                        || issue.namespace.to_lowercase().contains(&q)
+                        || issue.description.to_lowercase().contains(&q);
                 }
                 true
             })
@@ -114,7 +110,7 @@ impl AppState {
         let count = match self.active_tab {
             ActiveTab::Duplicates => self.filtered_issues(true).len(),
             ActiveTab::Orphans => self.filtered_issues(false).len(),
-            ActiveTab::TrafficGraph => 0,
+            ActiveTab::TrafficGraph => self.traces.len(),
         };
 
         if count > 0 {
@@ -122,7 +118,7 @@ impl AppState {
         } else {
             self.table_state.select(None);
         }
-        self.graph_scroll = 0;
+        self.selected_trace_index = 0;
     }
 
     pub fn next_item(&mut self) {
@@ -133,25 +129,26 @@ impl AppState {
             return;
         }
 
+        if self.active_tab == ActiveTab::TrafficGraph {
+            if !self.traces.is_empty() {
+                self.selected_trace_index = (self.selected_trace_index + 1) % self.traces.len();
+            }
+            return;
+        }
+
         let count = match self.active_tab {
             ActiveTab::Duplicates => self.filtered_issues(true).len(),
             ActiveTab::Orphans => self.filtered_issues(false).len(),
-            ActiveTab::TrafficGraph => {
-                if self.graph_scroll < self.graph_lines.len().saturating_sub(1) {
-                    self.graph_scroll += 1;
-                }
-                return;
-            }
+            _ => 0,
         };
 
-        if count == 0 {
-            return;
+        if count > 0 {
+            let i = match self.table_state.selected() {
+                Some(i) => (i + 1) % count,
+                None => 0,
+            };
+            self.table_state.select(Some(i));
         }
-        let i = match self.table_state.selected() {
-            Some(i) => (i + 1) % count,
-            None => 0,
-        };
-        self.table_state.select(Some(i));
     }
 
     pub fn previous_item(&mut self) {
@@ -160,22 +157,25 @@ impl AppState {
             return;
         }
 
+        if self.active_tab == ActiveTab::TrafficGraph {
+            if !self.traces.is_empty() {
+                self.selected_trace_index = (self.selected_trace_index + self.traces.len() - 1) % self.traces.len();
+            }
+            return;
+        }
+
         let count = match self.active_tab {
             ActiveTab::Duplicates => self.filtered_issues(true).len(),
             ActiveTab::Orphans => self.filtered_issues(false).len(),
-            ActiveTab::TrafficGraph => {
-                self.graph_scroll = self.graph_scroll.saturating_sub(1);
-                return;
-            }
+            _ => 0,
         };
 
-        if count == 0 {
-            return;
+        if count > 0 {
+            let i = match self.table_state.selected() {
+                Some(i) => (i + count - 1) % count,
+                None => 0,
+            };
+            self.table_state.select(Some(i));
         }
-        let i = match self.table_state.selected() {
-            Some(i) => (i + count - 1) % count,
-            None => 0,
-        };
-        self.table_state.select(Some(i));
     }
 }

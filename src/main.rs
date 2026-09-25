@@ -24,28 +24,35 @@ use tui::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. Сбор снимка состояния кластера
+    // 1. Инициализация подключения и сбор снимка ресурсов кластера
+    println!("Подключение к Kubernetes через kubeconfig...");
     let discovery = K8sDiscovery::new().await?;
+
+    println!("Сбор сетевых ресурсов (Gateways, VirtualServices, DestinationRules, Services, Pods)...");
     let snapshot = discovery.fetch_snapshot().await?;
 
-    // 2. Статический аудит
+    // 2. Статический анализ дубликатов и неиспользуемых ресурсов
     let analyzer = Analyzer::new(&snapshot);
     let (duplicates, orphans) = analyzer.run_all();
 
-    // 3. Построение топологии трафика
-    let topology = TrafficGraph::build(&snapshot, None);
-    let graph_display = topology.to_display_lines();
+    // 3. Построение сквозных цепочек трафика (Gateway -> Pods)
+    let traces = TrafficGraph::build_traces(&snapshot, None);
 
-    // 4. Инициализация терминала
+    // 4. Настройка терминала и перехват паники для безопасного завершения
     setup_panic_hook();
     let mut terminal = setup_terminal()?;
     let mut events = EventHandler::new();
-    let mut state = AppState::new(duplicates, orphans, graph_display, snapshot.namespaces.clone());
+    let mut state = AppState::new(
+        duplicates,
+        orphans,
+        traces,
+        snapshot.namespaces.clone(),
+    );
 
-    // Флаг необходимости перерисовки кадра (0% CPU в простое)
+    // Флаг необходимости перерисовки (Event-driven: 0% CPU в простое)
     let mut dirty = true;
 
-    // 5. Реактивный цикл событий
+    // 5. Главный цикл обработки событий
     while !state.should_quit {
         if dirty {
             terminal.draw(|f| ui::render(f, &mut state))?;
@@ -60,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
                 AppEvent::Input(key) => {
                     dirty = true;
 
-                    // Обработка текстового ввода в режиме поиска
+                    // 5.1. Режим строкового поиска и фильтрации
                     if state.input_mode == InputMode::Searching {
                         match key.code {
                             KeyCode::Esc => {
@@ -85,21 +92,31 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // Обработка выбора Namespace
+                    // 5.2. Модальный выбор Namespace Scope
                     if state.input_mode == InputMode::NamespaceSelect {
                         match key.code {
-                            KeyCode::Esc => state.input_mode = InputMode::Normal,
-                            KeyCode::Down | KeyCode::Char('j') => state.next_item(),
-                            KeyCode::Up | KeyCode::Char('k') => state.previous_item(),
+                            KeyCode::Esc => {
+                                state.input_mode = InputMode::Normal;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                state.next_item();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                state.previous_item();
+                            }
                             KeyCode::Enter => {
                                 state.selected_namespace = if state.ns_selector_index == 0 {
                                     None
                                 } else {
                                     state.namespaces.get(state.ns_selector_index - 1).cloned()
                                 };
-                                // Перестраиваем граф под выбранный namespace
-                                let new_top = TrafficGraph::build(&snapshot, state.selected_namespace.as_deref());
-                                state.graph_lines = new_top.to_display_lines();
+
+                                // Перестраиваем маршруты под выбранный Namespace Scope
+                                state.traces = TrafficGraph::build_traces(
+                                    &snapshot,
+                                    state.selected_namespace.as_deref(),
+                                );
+                                state.selected_trace_index = 0;
                                 state.input_mode = InputMode::Normal;
                                 state.reset_selection();
                             }
@@ -108,18 +125,22 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // Модальное окно деталей
+                    // 5.3. Модальное окно просмотра манифеста и деталей
                     if state.show_details {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => state.show_details = false,
+                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                                state.show_details = false;
+                            }
                             _ => {}
                         }
                         continue;
                     }
 
-                    // Обычный режим навигации
+                    // 5.4. Обычный режим навигации по интерфейсу
                     match key.code {
-                        KeyCode::Char('q') => state.should_quit = true,
+                        KeyCode::Char('q') => {
+                            state.should_quit = true;
+                        }
                         KeyCode::Char('/') => {
                             state.input_mode = InputMode::Searching;
                         }
@@ -131,13 +152,30 @@ async fn main() -> anyhow::Result<()> {
                                 state.show_details = true;
                             }
                         }
-                        KeyCode::Tab => state.next_tab(),
-                        KeyCode::BackTab => state.prev_tab(),
-                        KeyCode::Char('1') => state.active_tab = ActiveTab::Duplicates,
-                        KeyCode::Char('2') => state.active_tab = ActiveTab::Orphans,
-                        KeyCode::Char('3') => state.active_tab = ActiveTab::TrafficGraph,
-                        KeyCode::Down | KeyCode::Char('j') => state.next_item(),
-                        KeyCode::Up | KeyCode::Char('k') => state.previous_item(),
+                        KeyCode::Tab => {
+                            state.next_tab();
+                        }
+                        KeyCode::BackTab => {
+                            state.prev_tab();
+                        }
+                        KeyCode::Char('1') => {
+                            state.active_tab = ActiveTab::Duplicates;
+                            state.reset_selection();
+                        }
+                        KeyCode::Char('2') => {
+                            state.active_tab = ActiveTab::Orphans;
+                            state.reset_selection();
+                        }
+                        KeyCode::Char('3') => {
+                            state.active_tab = ActiveTab::TrafficGraph;
+                            state.reset_selection();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            state.next_item();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.previous_item();
+                        }
                         _ => {}
                     }
                 }
@@ -145,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 6. Корректный сброс параметров терминала
     restore_terminal(&mut terminal)?;
     Ok(())
 }
@@ -152,7 +191,12 @@ async fn main() -> anyhow::Result<()> {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        cursor::Hide
+    )?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend)
 }
@@ -172,7 +216,12 @@ fn setup_panic_hook() {
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, cursor::Show);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            cursor::Show
+        );
         original_hook(panic_info);
     }));
 }
